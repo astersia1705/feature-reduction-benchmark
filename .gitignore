@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+venv/
+env/
+.env
+# หากมีไฟล์ข้อมูลขนาดใหญ่เกิน 100MB กิตฮับจะไม่อนุญาตให้อัปโหลด
+*.csv
