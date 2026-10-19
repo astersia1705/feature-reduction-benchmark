@@ -8,19 +8,46 @@ import plotly.express as px
 from joblib import Parallel, delayed
 
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder, label_binarize
 from sklearn.impute import SimpleImputer
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.decomposition import PCA
 from sklearn.base import clone
 
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    ExtraTreesClassifier,
+    HistGradientBoostingClassifier
+)
 from sklearn.linear_model import LogisticRegression, Perceptron
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.naive_bayes import GaussianNB
 from sklearn.svm import SVC
-from sklearn.metrics import accuracy_score, recall_score, f1_score, precision_score
+from sklearn.neural_network import MLPClassifier
+
+from sklearn.metrics import (
+    accuracy_score,
+    recall_score,
+    f1_score,
+    precision_score,
+    roc_auc_score,
+    average_precision_score,
+    matthews_corrcoef
+)
+
+# ตรวจสอบว่ามีการติดตั้ง XGBoost และ LightGBM หรือไม่
+try:
+    from xgboost import XGBClassifier
+    HAS_XGB = True
+except ImportError:
+    HAS_XGB = False
+
+try:
+    from lightgbm import LGBMClassifier
+    HAS_LGBM = True
+except ImportError:
+    HAS_LGBM = False
 
 warnings.filterwarnings('ignore')
 
@@ -70,6 +97,9 @@ def auto_preprocess_dataset(df, target_col, user_id_cols=None):
     else:
         X = X_num
         
+    # ทำความสะอาดชื่อคอลัมน์เพื่อป้องกัน Error ใน LightGBM / XGBoost (ห้ามมีอักขระพิเศษ [], <, >)
+    X.columns = [str(c).replace('[', '_').replace(']', '_').replace('<', '_').replace('>', '_') for c in X.columns]
+    
     constant_cols = [c for c in X.columns if X[c].nunique() <= 1]
     X = X.drop(columns=constant_cols)
     
@@ -228,24 +258,77 @@ def backward_selection_fast(model, metric_func, X_tr, y_tr, X_val, y_val, baseli
     return selected
 
 
+# ==========================================
+# 3. Industry-Standard Models & Evaluation Metrics
+# ==========================================
+
 def get_default_models():
-    return {
+    models = {
         "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42, class_weight='balanced'),
-        "SVM": SVC(random_state=42, class_weight='balanced'),
+        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1, class_weight='balanced'),
+        "Extra Trees": ExtraTreesClassifier(n_estimators=100, random_state=42, n_jobs=-1, class_weight='balanced'),
+        "Hist Gradient Boosting": HistGradientBoostingClassifier(random_state=42, class_weight='balanced'),
+        "MLP (Neural Network)": MLPClassifier(hidden_layer_sizes=(100, 50), max_iter=500, random_state=42, early_stopping=True),
+        "SVM": SVC(random_state=42, class_weight='balanced', probability=True),
         "KNN": KNeighborsClassifier(n_jobs=-1),
-        "Perceptron": Perceptron(random_state=42, n_jobs=-1, class_weight='balanced'),
         "Naive Bayes": GaussianNB(),
         "Decision Tree": DecisionTreeClassifier(random_state=42, class_weight='balanced'),
-        "Random Forest": RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1, class_weight='balanced')
+        "Perceptron": Perceptron(random_state=42, n_jobs=-1, class_weight='balanced')
+    }
+    if HAS_XGB:
+        models["XGBoost"] = XGBClassifier(n_estimators=100, learning_rate=0.1, random_state=42, n_jobs=-1, eval_metric='logloss')
+    if HAS_LGBM:
+        models["LightGBM"] = LGBMClassifier(n_estimators=100, learning_rate=0.1, random_state=42, n_jobs=-1, class_weight='balanced', verbose=-1)
+    return models
+
+
+def compute_comprehensive_metrics(clf, X_te, y_true, y_pred, avg_m, classes):
+    """คำนวณตัวชี้วัดทั้งแบบพื้นฐาน และแบบที่ใช้จริงในระดับอุตสาหกรรม (ROC-AUC, PR-AUC, MCC)"""
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, average=avg_m, zero_division=0)
+    rec = recall_score(y_true, y_pred, average=avg_m, zero_division=0)
+    f1 = f1_score(y_true, y_pred, average=avg_m, zero_division=0)
+    mcc = matthews_corrcoef(y_true, y_pred)
+    
+    roc_auc = np.nan
+    pr_auc = np.nan
+    
+    try:
+        # ดึงค่าความน่าจะเป็น (Probability) หรือค่าคะแนนการตัดสินใจ (Decision Function)
+        if hasattr(clf, "predict_proba"):
+            y_score = clf.predict_proba(X_te)
+            if len(classes) == 2:
+                roc_auc = roc_auc_score(y_true, y_score[:, 1])
+                pr_auc = average_precision_score(y_true, y_score[:, 1])
+            else:
+                roc_auc = roc_auc_score(y_true, y_score, multi_class='ovr', average='macro')
+                y_bin = label_binarize(y_true, classes=classes)
+                pr_auc = average_precision_score(y_bin, y_score, average='macro')
+        elif hasattr(clf, "decision_function"):
+            y_score = clf.decision_function(X_te)
+            if len(classes) == 2:
+                roc_auc = roc_auc_score(y_true, y_score)
+                pr_auc = average_precision_score(y_true, y_score)
+    except Exception:
+        pass
+
+    return {
+        "Accuracy": round(acc, 4),
+        "Precision": round(prec, 4),
+        "Recall": round(rec, 4),
+        "F1_Score": round(f1, 4),
+        "ROC_AUC": round(float(roc_auc), 4) if not np.isnan(roc_auc) else np.nan,
+        "PR_AUC": round(float(pr_auc), 4) if not np.isnan(pr_auc) else np.nan,
+        "MCC": round(mcc, 4)
     }
 
 
 # ==========================================
-# 3. Main Application Interface
+# 4. Main Application Interface
 # ==========================================
 
 st.title("⚡ Dynamic Feature Reduction & ML Benchmark Studio")
-st.markdown("Upload any dataset file (`.csv` or `.xlsx`). The system will automatically clean the data, select features, and run benchmark models.")
+st.markdown("Upload any dataset file (`.csv` or `.xlsx`). The system will automatically clean the data, select features, and benchmark industry-standard models.")
 
 uploaded_file = st.file_uploader("📂 Choose Dataset File:", type=["csv", "xlsx"])
 
@@ -286,8 +369,8 @@ if uploaded_file is not None:
 
     st.divider()
 
-    st.subheader("2. Select Methods & Models")
-    m_col1, m_col2 = st.columns(2)
+    st.subheader("2. Select Methods, Models & Optimization Metric")
+    m_col1, m_col2, m_col3 = st.columns([2, 2, 1])
     with m_col1:
         methods_selected = st.multiselect(
             "Select Feature Reduction Methods:",
@@ -296,10 +379,23 @@ if uploaded_file is not None:
         )
     with m_col2:
         all_models = get_default_models()
+        default_model_picks = ["Logistic Regression", "Random Forest", "Hist Gradient Boosting", "MLP (Neural Network)"]
+        if HAS_XGB:
+            default_model_picks.append("XGBoost")
+        if HAS_LGBM:
+            default_model_picks.append("LightGBM")
+            
         models_selected = st.multiselect(
             "Select Machine Learning Models:",
             list(all_models.keys()),
-            default=["Logistic Regression", "Random Forest", "KNN", "Naive Bayes"]
+            default=[m for m in default_model_picks if m in all_models]
+        )
+    with m_col3:
+        opt_metric_choice = st.selectbox(
+            "Wrapper Search Metric:",
+            ["F1_Score", "MCC", "Accuracy", "Recall", "Precision"],
+            index=0,
+            help="Metric used by Forward/Backward/GA/Swarm to select features on validation set."
         )
 
     default_k = max(2, min(15, int(X.shape[1] * 0.4)))
@@ -311,15 +407,16 @@ if uploaded_file is not None:
         else:
             prog_bar = st.progress(0, text="Preparing and splitting dataset...")
             
-            unique_c = len(np.unique(y))
-            avg_m = 'macro' if unique_c > 2 else 'binary'
+            unique_classes = np.unique(y)
+            avg_m = 'macro' if len(unique_classes) > 2 else 'binary'
             metric_fns = {
-                'accuracy': lambda yt, yp: accuracy_score(yt, yp),
-                'recall': lambda yt, yp: recall_score(yt, yp, average=avg_m, zero_division=0),
-                'f1': lambda yt, yp: f1_score(yt, yp, average=avg_m, zero_division=0),
-                'precision': lambda yt, yp: precision_score(yt, yp, average=avg_m, zero_division=0)
+                'Accuracy': lambda yt, yp: accuracy_score(yt, yp),
+                'Recall': lambda yt, yp: recall_score(yt, yp, average=avg_m, zero_division=0),
+                'F1_Score': lambda yt, yp: f1_score(yt, yp, average=avg_m, zero_division=0),
+                'Precision': lambda yt, yp: precision_score(yt, yp, average=avg_m, zero_division=0),
+                'MCC': lambda yt, yp: matthews_corrcoef(yt, yp)
             }
-            opt_metric = metric_fns['f1']
+            opt_metric = metric_fns[opt_metric_choice]
 
             X_train_full, X_test_full, y_train_full, y_test_full = train_test_split(
                 X, y, test_size=0.3, random_state=42, stratify=y
@@ -348,17 +445,17 @@ if uploaded_file is not None:
                 y_pred = clf.predict(X_te_use)
                 train_time = time.time() - t_start
 
-                results_list.append({
+                eval_scores = compute_comprehensive_metrics(clf, X_te_use, y_test_full, y_pred, avg_m, unique_classes)
+
+                row_data = {
                     "Method": method_name,
                     "Model": model_name,
                     "Num_Features": X_tr_use.shape[1],
                     "Selection_Time_s": round(sel_time, 4),
                     "Train_Time_s": round(train_time, 4),
-                    "Accuracy": round(accuracy_score(y_test_full, y_pred), 4),
-                    "Precision": round(precision_score(y_test_full, y_pred, average=avg_m, zero_division=0), 4),
-                    "Recall": round(recall_score(y_test_full, y_pred, average=avg_m, zero_division=0), 4),
-                    "F1_Score": round(f1_score(y_test_full, y_pred, average=avg_m, zero_division=0), 4)
-                })
+                    **eval_scores
+                }
+                results_list.append(row_data)
                 selected_features_dict[f"{method_name} - {model_name}"] = feat_list
 
             if "Full Features" in methods_selected:
@@ -411,12 +508,12 @@ if uploaded_file is not None:
                 t0 = time.time()
                 n_comp = min(X_tr_scaled.shape[0], X_tr_scaled.shape[1], target_k)
                 pca = PCA(n_components=n_comp, random_state=42)
-                X_tr_pca = pca.fit_transform(X_tr_scaled)
-                X_te_pca = pca.transform(X_te_scaled)
+                pca_cols = [f"PC_{i+1}" for i in range(n_comp)]
+                X_tr_pca = pd.DataFrame(pca.fit_transform(X_tr_scaled), columns=pca_cols)
+                X_te_pca = pd.DataFrame(pca.transform(X_te_scaled), columns=pca_cols)
                 pca_time = time.time() - t0
-                pca_features = [f"PC_{i+1}" for i in range(n_comp)]
                 for m_name in models_selected:
-                    record_run("PCA", m_name, X_tr_pca, X_te_pca, pca_time, pca_features)
+                    record_run("PCA", m_name, X_tr_pca, X_te_pca, pca_time, pca_cols)
 
             search_features = vt_cols[:60] if len(vt_cols) > 60 else vt_cols
             X_tr_search = X_tr_sub_s[search_features]
@@ -444,7 +541,7 @@ if uploaded_file is not None:
                     record_run("Backward Selection", m_name, X_tr_scaled[s_cols], X_te_scaled[s_cols], b_time, s_cols)
 
             for m_label, OptCls in [("Genetic Algorithm", FastGeneticOptimizer), ("New Model (Binary Swarm)", FastBoardOptimizer)]:
-                if m_label in methods_selected:
+                if m_label in selected_methods if False else m_label in methods_selected:
                     cur_op += 1
                     prog_bar.progress(cur_op / total_ops, text=f"Processing: {m_label}...")
                     n_dim_s = len(search_features)
@@ -478,20 +575,41 @@ if uploaded_file is not None:
 
             df_res = pd.DataFrame(results_list)
 
-            t1, t2, t3, t4 = st.tabs(["🏆 Accuracy Summary (F1-Score)", "⚡ Speed vs Accuracy", "🧬 Selected Features", "📋 Results & Download"])
+            t1, t2, t3, t4 = st.tabs([
+                "🏆 Model Performance Comparison",
+                "⚡ Speed vs Performance Trade-off",
+                "🧬 Selected Features",
+                "📋 Full Metrics Table & Export"
+            ])
             
             with t1:
-                fig_bar = px.bar(
-                    df_res, x="Model", y="F1_Score", color="Method", barmode="group", text_auto=".3f",
-                    title="F1-Score Comparison by Model and Method"
+                available_plot_metrics = ["F1_Score", "ROC_AUC", "PR_AUC", "MCC", "Accuracy", "Recall", "Precision"]
+                chosen_plot_metric = st.radio(
+                    "Select Evaluation Metric to Visualize:",
+                    available_plot_metrics,
+                    horizontal=True
                 )
-                fig_bar.update_layout(yaxis_range=[max(0.0, df_res["F1_Score"].min() - 0.1), 1.05])
+                df_plot = df_res.dropna(subset=[chosen_plot_metric])
+                fig_bar = px.bar(
+                    df_plot, x="Model", y=chosen_plot_metric, color="Method", barmode="group", text_auto=".3f",
+                    title=f"{chosen_plot_metric} Comparison by Model and Feature Reduction Method"
+                )
+                if not df_plot.empty:
+                    fig_bar.update_layout(yaxis_range=[max(0.0, df_plot[chosen_plot_metric].min() - 0.1), 1.05])
                 st.plotly_chart(fig_bar, use_container_width=True)
+
+                with st.expander("💡 Guide to Industry Evaluation Metrics (Quick Reference)"):
+                    st.markdown("""
+                    * **ROC_AUC (Area Under ROC Curve):** Measures overall ability to discriminate between classes across all probability thresholds. Standard in Finance, Credit Scoring, and Healthcare.
+                    * **PR_AUC (Precision-Recall AUC):** Focuses on positive class performance. The gold standard for **Imbalanced Datasets** (e.g., Fraud Detection, Churn Prediction).
+                    * **MCC (Matthews Correlation Coefficient):** A balanced metric considering all 4 quadrants of the Confusion Matrix ($TP, TN, FP, FN$). Highly reliable even when classes are skewed.
+                    * **F1_Score:** Harmonic mean of Precision and Recall.
+                    """)
 
             with t2:
                 fig_scatter = px.scatter(
                     df_res, x="Selection_Time_s", y="F1_Score", color="Method", symbol="Model", size="Num_Features",
-                    hover_data=["Accuracy", "Recall", "Num_Features"],
+                    hover_data=["ROC_AUC", "PR_AUC", "MCC", "Accuracy", "Num_Features"],
                     title="Trade-off: Selection Time (s) vs F1-Score (Point size = Num Features)"
                 )
                 st.plotly_chart(fig_scatter, use_container_width=True)
@@ -505,9 +623,9 @@ if uploaded_file is not None:
             with t4:
                 st.dataframe(df_res.sort_values(by="F1_Score", ascending=False), use_container_width=True)
                 st.download_button(
-                    "📥 Download Results (CSV)",
+                    "📥 Download Full Benchmark Results (CSV)",
                     data=df_res.to_csv(index=False).encode('utf-8'),
-                    file_name="benchmark_results.csv",
+                    file_name="industry_benchmark_results.csv",
                     mime="text/csv"
                 )
 else:
