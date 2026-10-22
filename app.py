@@ -36,7 +36,6 @@ from sklearn.metrics import (
     matthews_corrcoef
 )
 
-# ตรวจสอบว่ามีการติดตั้ง XGBoost และ LightGBM หรือไม่
 try:
     from xgboost import XGBClassifier
     HAS_XGB = True
@@ -97,7 +96,6 @@ def auto_preprocess_dataset(df, target_col, user_id_cols=None):
     else:
         X = X_num
         
-    # ทำความสะอาดชื่อคอลัมน์เพื่อป้องกัน Error ใน LightGBM / XGBoost (ห้ามมีอักขระพิเศษ [], <, >)
     X.columns = [str(c).replace('[', '_').replace(']', '_').replace('<', '_').replace('>', '_') for c in X.columns]
     
     constant_cols = [c for c in X.columns if X[c].nunique() <= 1]
@@ -259,7 +257,7 @@ def backward_selection_fast(model, metric_func, X_tr, y_tr, X_val, y_val, baseli
 
 
 # ==========================================
-# 3. Industry-Standard Models & Evaluation Metrics
+# 3. Models & Evaluation Metrics
 # ==========================================
 
 def get_default_models():
@@ -283,7 +281,6 @@ def get_default_models():
 
 
 def compute_comprehensive_metrics(clf, X_te, y_true, y_pred, avg_m, classes):
-    """คำนวณตัวชี้วัดทั้งแบบพื้นฐาน และแบบที่ใช้จริงในระดับอุตสาหกรรม (ROC-AUC, PR-AUC, MCC)"""
     acc = accuracy_score(y_true, y_pred)
     prec = precision_score(y_true, y_pred, average=avg_m, zero_division=0)
     rec = recall_score(y_true, y_pred, average=avg_m, zero_division=0)
@@ -294,7 +291,6 @@ def compute_comprehensive_metrics(clf, X_te, y_true, y_pred, avg_m, classes):
     pr_auc = np.nan
     
     try:
-        # ดึงค่าความน่าจะเป็น (Probability) หรือค่าคะแนนการตัดสินใจ (Decision Function)
         if hasattr(clf, "predict_proba"):
             y_score = clf.predict_proba(X_te)
             if len(classes) == 2:
@@ -345,7 +341,7 @@ if uploaded_file is not None:
     st.subheader("1. Dataset Configuration")
     c1, c2 = st.columns([1, 1])
     with c1:
-        default_target_idx = len(df_raw.columns) - 1
+        default_target_idx = 0 if 'Bankrupt?' in df_raw.columns else len(df_raw.columns) - 1
         target_col = st.selectbox("Select Target Column:", df_raw.columns, index=default_target_idx)
     with c2:
         other_cols = [c for c in df_raw.columns if c != target_col]
@@ -394,13 +390,13 @@ if uploaded_file is not None:
         opt_metric_choice = st.selectbox(
             "Wrapper Search Metric:",
             ["F1_Score", "MCC", "Accuracy", "Recall", "Precision"],
-            index=0,
-            help="Metric used by Forward/Backward/GA/Swarm to select features on validation set."
+            index=0
         )
 
     default_k = max(2, min(15, int(X.shape[1] * 0.4)))
     target_k = st.slider("Target Number of Features (Target k) for Forward / PCA:", min_value=2, max_value=max(3, X.shape[1]), value=default_k)
 
+    # ปุ่มคำนวณและเก็บผลลง session_state
     if st.button("🚀 Compute & Run Benchmark", type="primary", use_container_width=True):
         if not methods_selected or not models_selected:
             st.warning("Please select at least one method and one model.")
@@ -541,7 +537,7 @@ if uploaded_file is not None:
                     record_run("Backward Selection", m_name, X_tr_scaled[s_cols], X_te_scaled[s_cols], b_time, s_cols)
 
             for m_label, OptCls in [("Genetic Algorithm", FastGeneticOptimizer), ("New Model (Binary Swarm)", FastBoardOptimizer)]:
-                if m_label in selected_methods if False else m_label in methods_selected:
+                if m_label in methods_selected:
                     cur_op += 1
                     prog_bar.progress(cur_op / total_ops, text=f"Processing: {m_label}...")
                     n_dim_s = len(search_features)
@@ -571,62 +567,65 @@ if uploaded_file is not None:
                         record_run(m_label, m_name, X_tr_scaled[s_cols], X_te_scaled[s_cols], opt_time, s_cols)
 
             prog_bar.empty()
-            st.success("🎉 Benchmark completed successfully!")
-
-            df_res = pd.DataFrame(results_list)
-
-            t1, t2, t3, t4 = st.tabs([
-                "🏆 Model Performance Comparison",
-                "⚡ Speed vs Performance Trade-off",
-                "🧬 Selected Features",
-                "📋 Full Metrics Table & Export"
-            ])
             
-            with t1:
-                available_plot_metrics = ["F1_Score", "ROC_AUC", "PR_AUC", "MCC", "Accuracy", "Recall", "Precision"]
-                chosen_plot_metric = st.radio(
-                    "Select Evaluation Metric to Visualize:",
-                    available_plot_metrics,
-                    horizontal=True
-                )
-                df_plot = df_res.dropna(subset=[chosen_plot_metric])
-                fig_bar = px.bar(
-                    df_plot, x="Model", y=chosen_plot_metric, color="Method", barmode="group", text_auto=".3f",
-                    title=f"{chosen_plot_metric} Comparison by Model and Feature Reduction Method"
-                )
-                if not df_plot.empty:
-                    fig_bar.update_layout(yaxis_range=[max(0.0, df_plot[chosen_plot_metric].min() - 0.1), 1.05])
-                st.plotly_chart(fig_bar, use_container_width=True)
+            # บันทึกผลลัพธ์ลง session_state ป้องกันการเด้งเริ่มใหม่
+            st.session_state['benchmark_df'] = pd.DataFrame(results_list)
+            st.session_state['selected_features'] = selected_features_dict
+            st.session_state['available_features_count'] = X.shape[1]
 
-                with st.expander("💡 Guide to Industry Evaluation Metrics (Quick Reference)"):
-                    st.markdown("""
-                    * **ROC_AUC (Area Under ROC Curve):** Measures overall ability to discriminate between classes across all probability thresholds. Standard in Finance, Credit Scoring, and Healthcare.
-                    * **PR_AUC (Precision-Recall AUC):** Focuses on positive class performance. The gold standard for **Imbalanced Datasets** (e.g., Fraud Detection, Churn Prediction).
-                    * **MCC (Matthews Correlation Coefficient):** A balanced metric considering all 4 quadrants of the Confusion Matrix ($TP, TN, FP, FN$). Highly reliable even when classes are skewed.
-                    * **F1_Score:** Harmonic mean of Precision and Recall.
-                    """)
+    # ดึงผลลัพธ์จาก session_state มาแสดงผล (คลิกเปลี่ยนตัวชี้วัดแล้วจะไม่เริ่มคำนวณใหม่)
+    if 'benchmark_df' in st.session_state:
+        df_res = st.session_state['benchmark_df']
+        selected_features_dict = st.session_state['selected_features']
+        total_feats = st.session_state['available_features_count']
 
-            with t2:
-                fig_scatter = px.scatter(
-                    df_res, x="Selection_Time_s", y="F1_Score", color="Method", symbol="Model", size="Num_Features",
-                    hover_data=["ROC_AUC", "PR_AUC", "MCC", "Accuracy", "Num_Features"],
-                    title="Trade-off: Selection Time (s) vs F1-Score (Point size = Num Features)"
-                )
-                st.plotly_chart(fig_scatter, use_container_width=True)
+        st.success("🎉 Benchmark completed successfully!")
 
-            with t3:
-                chosen_key = st.selectbox("View selected features for each method:", list(selected_features_dict.keys()))
-                f_list = selected_features_dict[chosen_key]
-                st.info(f"Number of selected features: **{len(f_list)}** (out of {X.shape[1]})")
-                st.write(f_list)
+        t1, t2, t3, t4 = st.tabs([
+            "🏆 Model Performance Comparison",
+            "⚡ Speed vs Performance Trade-off",
+            "🧬 Selected Features",
+            "📋 Full Metrics Table & Export"
+        ])
+        
+        with t1:
+            available_plot_metrics = ["F1_Score", "ROC_AUC", "PR_AUC", "MCC", "Accuracy", "Recall", "Precision"]
+            chosen_plot_metric = st.radio(
+                "Select Evaluation Metric to Visualize:",
+                available_plot_metrics,
+                horizontal=True,
+                key="chosen_metric_radio"
+            )
+            df_plot = df_res.dropna(subset=[chosen_plot_metric])
+            fig_bar = px.bar(
+                df_plot, x="Model", y=chosen_plot_metric, color="Method", barmode="group", text_auto=".3f",
+                title=f"{chosen_plot_metric} Comparison by Model and Feature Reduction Method"
+            )
+            if not df_plot.empty:
+                fig_bar.update_layout(yaxis_range=[max(0.0, df_plot[chosen_plot_metric].min() - 0.1), 1.05])
+            st.plotly_chart(fig_bar, use_container_width=True)
 
-            with t4:
-                st.dataframe(df_res.sort_values(by="F1_Score", ascending=False), use_container_width=True)
-                st.download_button(
-                    "📥 Download Full Benchmark Results (CSV)",
-                    data=df_res.to_csv(index=False).encode('utf-8'),
-                    file_name="industry_benchmark_results.csv",
-                    mime="text/csv"
-                )
+        with t2:
+            fig_scatter = px.scatter(
+                df_res, x="Selection_Time_s", y="F1_Score", color="Method", symbol="Model", size="Num_Features",
+                hover_data=["ROC_AUC", "PR_AUC", "MCC", "Accuracy", "Num_Features"],
+                title="Trade-off: Selection Time (s) vs F1-Score (Point size = Num Features)"
+            )
+            st.plotly_chart(fig_scatter, use_container_width=True)
+
+        with t3:
+            chosen_key = st.selectbox("View selected features for each method:", list(selected_features_dict.keys()))
+            f_list = selected_features_dict[chosen_key]
+            st.info(f"Number of selected features: **{len(f_list)}** (out of {total_feats})")
+            st.write(f_list)
+
+        with t4:
+            st.dataframe(df_res.sort_values(by="F1_Score", ascending=False), use_container_width=True)
+            st.download_button(
+                "📥 Download Full Benchmark Results (CSV)",
+                data=df_res.to_csv(index=False).encode('utf-8'),
+                file_name="industry_benchmark_results.csv",
+                mime="text/csv"
+            )
 else:
     st.info("👆 Please upload a dataset file above to start processing.")
